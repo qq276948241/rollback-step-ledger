@@ -6,6 +6,7 @@ import { WithSchemaPlugin } from '../plugin/with-schema/with-schema-plugin.js'
 import type { CreateSchemaBuilder } from '../schema/create-schema-builder.js'
 import type { CreateTableBuilder } from '../schema/create-table-builder.js'
 import { freeze, getLast, isObject } from '../util/object-utils.js'
+import { ParameterCountGuard } from './parameter-count-guard.js'
 
 export const DEFAULT_MIGRATION_TABLE = 'kysely_migration'
 export const DEFAULT_MIGRATION_LOCK_TABLE = 'kysely_migration_lock'
@@ -19,8 +20,9 @@ export interface Migration {
   /**
    * An optional down method.
    *
-   * If you don't provide a down method, the migration is skipped when
-   * migrating down.
+   * If you don't provide a down method, migrating down stops with an error
+   * when it reaches this migration. The migration is not rolled back and its
+   * record is left in the migration table.
    */
   down?(db: Kysely<any>): Promise<void>
 }
@@ -322,7 +324,6 @@ export class Migrator {
       await this.#ensureMigrationTableSchemaExists()
       await this.#ensureMigrationTableExists()
       await this.#ensureMigrationLockTableExists()
-      await this.#ensureLockRowExists()
 
       return await this.#runMigrations(getMigrationDirectionAndStep, options)
     } catch (error) {
@@ -360,6 +361,18 @@ export class Migrator {
     return new NoopPlugin()
   }
 
+  /**
+   * A copy of the database without any user plugins.
+   *
+   * The migrator's internal tables are created through this handle so that
+   * the bookkeeping schema always gets created exactly the same way, no
+   * matter what plugins the user has installed. Everything executed during
+   * the migration run itself goes through the user's plugins.
+   */
+  get #internalDb(): Kysely<any> {
+    return this.#props.db.withoutPlugins()
+  }
+
   async #ensureMigrationTableSchemaExists(): Promise<void> {
     if (!this.#migrationTableSchema) {
       // Use default schema. Nothing to do.
@@ -374,7 +387,7 @@ export class Migrator {
 
     try {
       await this.#createIfNotExists(
-        this.#props.db.schema.createSchema(this.#migrationTableSchema),
+        this.#internalDb.schema.createSchema(this.#migrationTableSchema),
       )
     } catch (error) {
       const schemaExists = await this.#doesSchemaExist()
@@ -397,7 +410,7 @@ export class Migrator {
 
     try {
       await this.#createIfNotExists(
-        this.#props.db.schema
+        this.#internalDb.schema
           .withPlugin(this.#schemaPlugin)
           .createTable(this.#migrationTable)
           .addColumn('name', 'varchar(255)', (col) =>
@@ -428,7 +441,7 @@ export class Migrator {
 
     try {
       await this.#createIfNotExists(
-        this.#props.db.schema
+        this.#internalDb.schema
           .withPlugin(this.#schemaPlugin)
           .createTable(this.#migrationLockTable)
           .addColumn('id', 'varchar(255)', (col) => col.notNull().primaryKey())
@@ -448,21 +461,21 @@ export class Migrator {
     }
   }
 
-  async #ensureLockRowExists(): Promise<void> {
-    const lockRowExists = await this.#doesLockRowExists()
+  async #ensureLockRowExists(db: Kysely<any>): Promise<void> {
+    const lockRowExists = await this.#doesLockRowExists(db)
 
     if (lockRowExists) {
       return
     }
 
     try {
-      await this.#props.db
+      await db
         .withPlugin(this.#schemaPlugin)
         .insertInto(this.#migrationLockTable)
         .values({ id: MIGRATION_LOCK_ID, is_locked: 0 })
         .execute()
     } catch (error) {
-      const lockRowExists = await this.#doesLockRowExists()
+      const lockRowExists = await this.#doesLockRowExists(db)
 
       if (!lockRowExists) {
         throw error
@@ -488,8 +501,8 @@ export class Migrator {
     )
   }
 
-  async #doesLockRowExists(): Promise<boolean> {
-    const lockRow = await this.#props.db
+  async #doesLockRowExists(db: Kysely<any>): Promise<boolean> {
+    const lockRow = await db
       .withPlugin(this.#schemaPlugin)
       .selectFrom(this.#migrationLockTable)
       .where('id', '=', MIGRATION_LOCK_ID)
@@ -515,8 +528,25 @@ export class Migrator {
       lockTableSchema: this.#props.migrationTableSchema,
     })
 
+    const disableTransactions =
+      options?.disableTransactions ?? this.#props.disableTransactions
+
+    // Each migration runs in its own transaction when the dialect supports
+    // transactional DDL and transactions haven't been disabled. A migration
+    // is recorded only after it has fully finished, so a failed migration
+    // is rolled back together with its record attempt while already
+    // finished migrations stay recorded.
+    const transactional =
+      !disableTransactions && adapter.supportsTransactionalDdl === true
+
     const run = async (db: Kysely<any>): Promise<MigrationResultSet> => {
-      const state = await this.#getState(db)
+      // All queries of the migration run go through the user's plugins,
+      // guarded so that no plugin can change a query's parameter count.
+      const guardedDb = this.#withMigrationPlugins(db)
+
+      await this.#ensureLockRowExists(guardedDb)
+
+      const state = await this.#getState(guardedDb)
 
       if (state.migrations.length === 0) {
         return { results: [] }
@@ -529,9 +559,9 @@ export class Migrator {
       }
 
       if (direction === 'Down') {
-        return await this.#migrateDown(db, state, step)
+        return await this.#migrateDown(guardedDb, state, step, transactional)
       } else if (direction === 'Up') {
-        return await this.#migrateUp(db, state, step)
+        return await this.#migrateUp(guardedDb, state, step, transactional)
       }
 
       return { results: [] }
@@ -549,9 +579,6 @@ export class Migrator {
       }
     }
 
-    const disableTransactions =
-      options?.disableTransactions ?? this.#props.disableTransactions
-
     if (this.#props.db.isTransaction) {
       if (!adapter.supportsTransactionalDdl) {
         throw new Error(
@@ -568,15 +595,53 @@ export class Migrator {
       return runWithLock(this.#props.db, run)
     }
 
-    if (adapter.supportsTransactionalDdl && !disableTransactions) {
-      return this.#props.db
-        .connection()
-        .execute((db) =>
-          runWithLock(db, (db) => db.transaction().execute((trx) => run(trx))),
-        )
+    if (!adapter.supportsTransactionalDdl && !disableTransactions) {
+      // The dialect can't run schema changes in a transaction. Say so before
+      // running anything so a half-finished migration never comes as a
+      // surprise. A migration is still only recorded after it has fully
+      // finished.
+      console.log(
+        'kysely: warning: this dialect does not support transactional DDL. ' +
+          'Migrations are executed without a transaction. If a migration ' +
+          'fails, the schema changes it already made cannot be rolled back ' +
+          'automatically, but the migration is not recorded as executed.',
+      )
     }
 
+    // A single connection is reserved for the whole migration run. It is not
+    // lent to any other query while migrations are running and is returned
+    // to the pool once the run is over.
     return this.#props.db.connection().execute((db) => runWithLock(db, run))
+  }
+
+  /**
+   * Installs the plugins that guard the queries executed by migrations.
+   *
+   * The guard's `before` plugin is placed at the front of the plugin chain
+   * and its `after` plugin at the back. User plugins sit between them, see
+   * each other's transformed operation nodes in registration order, and are
+   * not allowed to change the query's parameter count.
+   *
+   * When no user plugins are installed, there's nothing to guard and the
+   * database is returned as is. This way a migrator that was given a
+   * transaction runs the migrations in exactly that transaction object.
+   */
+  #withMigrationPlugins(db: Kysely<any>): Kysely<any> {
+    const plugins = db.getExecutor().plugins
+
+    if (plugins.length === 0) {
+      return db
+    }
+
+    const guard = new ParameterCountGuard()
+
+    let guarded = db.withoutPlugins().withPlugin(guard.before)
+
+    for (const plugin of plugins) {
+      guarded = guarded.withPlugin(plugin)
+    }
+
+    return guarded.withPlugin(guard.after)
   }
 
   async #getState(db: Kysely<any>): Promise<MigrationState> {
@@ -682,6 +747,7 @@ export class Migrator {
     db: Kysely<any>,
     state: MigrationState,
     step: number,
+    transactional: boolean,
   ): Promise<MigrationResultSet> {
     const migrationsToRollback: ReadonlyArray<NamedMigration> =
       state.executedMigrations
@@ -701,21 +767,45 @@ export class Migrator {
 
     for (let i = 0; i < results.length; ++i) {
       const migration = migrationsToRollback[i]
+      const { down } = migration
+
+      if (!down) {
+        // A migration without a down method can't be rolled back. Stop right
+        // here instead of deleting its record or rolling back even earlier
+        // migrations.
+        results[i] = {
+          migrationName: migration.name,
+          direction: 'Down',
+          status: 'Error',
+        }
+
+        throw new MigrationResultSetError({
+          error: new Error(
+            `migration "${migration.name}" doesn't have a "down" method. ` +
+              'Cannot roll it back. Its record was left in the migration table.',
+          ),
+          results,
+        })
+      }
 
       try {
-        if (migration.down) {
-          await migration.down(db)
+        // Each rollback runs in its own transaction (when the dialect
+        // supports transactional DDL). The record is deleted only after the
+        // rollback has fully finished. If anything fails, the whole step is
+        // rolled back and the record is left in the migration table.
+        await this.#runMigrationStep(db, transactional, async (db) => {
+          await down(db)
           await db
             .withPlugin(this.#schemaPlugin)
             .deleteFrom(this.#migrationTable)
             .where('name', '=', migration.name)
             .execute()
+        })
 
-          results[i] = {
-            migrationName: migration.name,
-            direction: 'Down',
-            status: 'Success',
-          }
+        results[i] = {
+          migrationName: migration.name,
+          direction: 'Down',
+          status: 'Success',
         }
       } catch (error) {
         results[i] = {
@@ -738,6 +828,7 @@ export class Migrator {
     db: Kysely<any>,
     state: MigrationState,
     step: number,
+    transactional: boolean,
   ): Promise<MigrationResultSet> {
     const migrationsToRun: ReadonlyArray<NamedMigration> =
       state.pendingMigrations.slice(0, step)
@@ -751,18 +842,24 @@ export class Migrator {
     })
 
     for (let i = 0; i < results.length; i++) {
-      const migration = state.pendingMigrations[i]
+      const migration = migrationsToRun[i]
 
       try {
-        await migration.up(db)
-        await db
-          .withPlugin(this.#schemaPlugin)
-          .insertInto(this.#migrationTable)
-          .values({
-            name: migration.name,
-            timestamp: new Date().toISOString(),
-          })
-          .execute()
+        // Each migration runs in its own transaction (when the dialect
+        // supports transactional DDL). The migration is recorded only after
+        // it has fully finished. If anything fails, the whole step is rolled
+        // back and nothing is recorded.
+        await this.#runMigrationStep(db, transactional, async (db) => {
+          await migration.up(db)
+          await db
+            .withPlugin(this.#schemaPlugin)
+            .insertInto(this.#migrationTable)
+            .values({
+              name: migration.name,
+              timestamp: new Date().toISOString(),
+            })
+            .execute()
+        })
 
         results[i] = {
           migrationName: migration.name,
@@ -784,6 +881,28 @@ export class Migrator {
     }
 
     return { results }
+  }
+
+  /**
+   * Runs a single migration step.
+   *
+   * When the dialect supports transactional DDL and transactions haven't been
+   * disabled, the step is wrapped in its own transaction so a failure rolls
+   * back everything the step did, including schema changes. When the
+   * migrator was given a transaction, the user owns the transaction and the
+   * step runs directly in it.
+   */
+  async #runMigrationStep(
+    db: Kysely<any>,
+    transactional: boolean,
+    step: (db: Kysely<any>) => Promise<void>,
+  ): Promise<void> {
+    if (transactional && !db.isTransaction) {
+      await db.transaction().execute(step)
+      return
+    }
+
+    await step(db)
   }
 
   async #createIfNotExists(
@@ -932,9 +1051,9 @@ export interface MigrationResult {
    * The execution status.
    *
    *  - `Success` means the migration was successfully executed. Note that
-   *    if any of the later migrations in the {@link MigrationResultSet.results}
-   *    list failed (have status `Error`) AND the dialect supports transactional
-   *    DDL, even the successfull migrations were rolled back.
+   *    each migration runs in its own transaction when the dialect supports
+   *    transactional DDL, so a later migration's failure doesn't roll back
+   *    this migration.
    *
    *  - `Error` means the migration failed. In this case the
    *    {@link MigrationResultSet.error} contains the error.
